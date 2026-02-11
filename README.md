@@ -1,98 +1,173 @@
-<p align="center">
-  <a href="http://nestjs.com/" target="blank"><img src="https://nestjs.com/img/logo-small.svg" width="120" alt="Nest Logo" /></a>
-</p>
+# Backend Playground 2 — Orders API
 
-[circleci-image]: https://img.shields.io/circleci/build/github/nestjs/nest/master?token=abc123def456
-[circleci-url]: https://circleci.com/gh/nestjs/nest
+NestJS + PostgreSQL project implementing transactional order creation with idempotency, concurrency protection, and SQL optimization.
 
-  <p align="center">A progressive <a href="http://nodejs.org" target="_blank">Node.js</a> framework for building efficient and scalable server-side applications.</p>
-    <p align="center">
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/v/@nestjs/core.svg" alt="NPM Version" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/l/@nestjs/core.svg" alt="Package License" /></a>
-<a href="https://www.npmjs.com/~nestjscore" target="_blank"><img src="https://img.shields.io/npm/dm/@nestjs/common.svg" alt="NPM Downloads" /></a>
-<a href="https://circleci.com/gh/nestjs/nest" target="_blank"><img src="https://img.shields.io/circleci/build/github/nestjs/nest/master" alt="CircleCI" /></a>
-<a href="https://discord.gg/G7Qnnhy" target="_blank"><img src="https://img.shields.io/badge/discord-online-brightgreen.svg" alt="Discord"/></a>
-<a href="https://opencollective.com/nest#backer" target="_blank"><img src="https://opencollective.com/nest/backers/badge.svg" alt="Backers on Open Collective" /></a>
-<a href="https://opencollective.com/nest#sponsor" target="_blank"><img src="https://opencollective.com/nest/sponsors/badge.svg" alt="Sponsors on Open Collective" /></a>
-  <a href="https://paypal.me/kamilmysliwiec" target="_blank"><img src="https://img.shields.io/badge/Donate-PayPal-ff3f59.svg" alt="Donate us"/></a>
-    <a href="https://opencollective.com/nest#sponsor"  target="_blank"><img src="https://img.shields.io/badge/Support%20us-Open%20Collective-41B883.svg" alt="Support us"></a>
-  <a href="https://twitter.com/nestframework" target="_blank"><img src="https://img.shields.io/twitter/follow/nestframework.svg?style=social&label=Follow" alt="Follow us on Twitter"></a>
-</p>
-  <!--[![Backers on Open Collective](https://opencollective.com/nest/backers/badge.svg)](https://opencollective.com/nest#backer)
-  [![Sponsors on Open Collective](https://opencollective.com/nest/sponsors/badge.svg)](https://opencollective.com/nest#sponsor)-->
-
-## Description
-
-[Nest](https://github.com/nestjs/nest) framework TypeScript starter repository.
-
-## Project setup
+## Setup
 
 ```bash
-$ npm install
+npm install
+cp .env.example .env.dev   # adjust DB credentials if needed
+
+# Run migrations
+NODE_ENV=dev npm run migration:run
+
+# Seed data
+NODE_ENV=dev npm run seed
+
+# Start the server
+NODE_ENV=dev npm run start:dev
 ```
 
-## Compile and run the project
+## API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| `GET` | `/orders` | List orders (filterable by status, userId, date range) |
+| `POST` | `/orders` | Create order (requires `Idempotency-Key` header) |
+| `GET` | `/products` | List all products |
+| `GET` | `/users` | List all users |
+| `GET` | `/users/:id` | Get user by UUID |
+
+---
+
+## Homework 05 — Technical Decisions
+
+### 1. Transaction Implementation
+
+All order creation logic runs inside a single **QueryRunner transaction** (`orders.service.ts`):
+
+1. `queryRunner.startTransaction()`
+2. Create `Order` row (with `idempotencyKey`)
+3. Lock product rows (`SELECT ... FOR UPDATE`)
+4. Decrement stock atomically (`UPDATE ... WHERE stock >= $1`)
+5. Create `OrderItem` rows
+6. `commitTransaction()` — or `rollbackTransaction()` on any error
+7. `release()` in `finally` block — always
+
+If any step fails, the entire transaction is rolled back. No partial writes are possible.
+
+### 2. Concurrency Mechanism — Pessimistic Locking
+
+**Choice: pessimistic locking (`SELECT ... FOR UPDATE`)**
+
+Why pessimistic over optimistic:
+
+- **Order creation is a write-heavy, conflict-prone operation.** When multiple users order the same product simultaneously, conflicts are expected — not rare. Optimistic locking would lead to frequent retries, adding latency and complexity.
+- **Pessimistic locking guarantees correctness in a single round-trip.** The product row is locked for the duration of the transaction, so no other transaction can read stale stock values.
+- **Simpler code.** No need for version columns, retry loops, or backoff logic.
+
+Flow:
+1. Lock all requested product rows with `lock: { mode: 'pessimistic_write' }` (translates to `SELECT ... FOR UPDATE`)
+2. Atomically decrement stock: `UPDATE products SET stock = stock - $1 WHERE id = $2 AND stock >= $1`
+3. Check affected rows — if 0, throw `BadRequestException` with details about which product has insufficient stock
+
+This prevents overselling even under high concurrency: if two transactions try to buy the last item, one will wait for the other's lock to release, then see the updated (zero) stock and fail gracefully.
+
+### 3. Idempotency
+
+Two layers of protection:
+
+#### Layer 1 — `IdempotencyInterceptor` (application-level cache)
+
+- Client must send `Idempotency-Key: <uuid>` header with every `POST /orders` request.
+- On first request: interceptor creates a `processing` record in the `idempotency` table, passes through to the handler, then saves the full response (`statusCode` + `body`) as `completed`.
+- On repeated request with same key: interceptor finds the `completed` record and returns the cached response immediately — the handler is never called.
+- If a concurrent request arrives while the first is still processing: returns `409 Conflict`.
+
+#### Layer 2 — `orders.idempotency_key` UNIQUE constraint (race-condition safety net)
+
+- Even if two concurrent requests bypass the interceptor check simultaneously, the `UNIQUE` constraint on `orders.idempotency_key` catches the duplicate.
+- The `catch` block detects PostgreSQL error `23505` on `idempotency_key`, fetches the existing order, and returns it.
+
+### 4. Error Handling
+
+| Scenario | HTTP Status | Behavior |
+|----------|-------------|----------|
+| Insufficient stock | `400 Bad Request` | Message includes product title, available stock, and requested quantity |
+| Duplicate idempotency key (cached) | Original status (200/201) | Returns cached response from first request |
+| Duplicate idempotency key (race) | 200/201 | Fetches and returns existing order |
+| Concurrent processing of same key | `409 Conflict` | "Request is already being processed" |
+| Missing `Idempotency-Key` header | `400 Bad Request` | "Idempotency-Key header is required" |
+| Any other error | `500` | Transaction rolled back, error propagated |
+
+---
+
+## SQL Optimization
+
+### Hot Query
+
+The `GET /orders` endpoint with filters — used for listing a user's orders by status within a date range:
+
+```sql
+SELECT o.id, o.user_id, o.status, o.created_at,
+       oi.product_id, oi.quantity
+FROM orders o
+LEFT JOIN order_items oi ON oi.order_id = o.id
+WHERE o.user_id = ?
+  AND o.status = 'CREATED'
+  AND o.created_at >= '2026-01-01'
+  AND o.created_at <= '2026-02-01'
+ORDER BY o.created_at DESC
+LIMIT 20 OFFSET 0;
+```
+
+### Before Optimization
+
+Existing single-column indexes: `IDX_orders_user_id` and `IDX_orders_created_at`.
+
+**Expected plan:** The planner cannot satisfy all three WHERE conditions + ORDER BY with a single index. It either:
+- Does a Seq Scan + Sort (small table), or
+- Uses BitmapAnd of two separate indexes → Bitmap Heap Scan → Sort
+
+This means: extra Sort step, more buffer reads, no early termination from LIMIT.
+
+### Optimization — Composite Index
+
+```sql
+CREATE INDEX "IDX_orders_user_status_created"
+  ON "orders" ("user_id", "status", "created_at" DESC);
+```
+
+Added via migration `1700000003000-add-orders-composite-index.ts`.
+
+### After Optimization
+
+**Expected plan:**
+```
+Index Scan using IDX_orders_user_status_created on orders o
+  Index Cond: (user_id = '...' AND status = 'CREATED'
+               AND created_at >= '2026-01-01' AND created_at <= '2026-02-01')
+  → Nested Loop Left Join with order_items (using IDX_order_items_order_id)
+```
+
+### Why This Is Better
+
+1. **Single index covers all WHERE conditions + ORDER BY.** No separate Sort step needed.
+2. **`created_at DESC` in the index matches `ORDER BY created_at DESC`** — the planner can do a forward index scan, returning rows already in the correct order.
+3. **LIMIT 20 benefits from early termination.** Since rows come out sorted from the index, PostgreSQL stops after finding 20 matching rows instead of sorting the entire result set.
+4. **Column order matters.** `(user_id, status, created_at)` follows the equality-first, range-last principle: `user_id` and `status` are equality conditions (high selectivity), `created_at` is the range + sort column.
+
+### EXPLAIN scripts
+
+- `scripts/explain-before.sql` — run before migration to capture the plan without the composite index
+- `scripts/explain-after.sql` — run after migration to capture the plan with the composite index
+
+---
+
+## Migrations
+
+| Migration | What it does |
+|-----------|-------------|
+| `1700000000000-init` | Creates `users`, `products`, `orders`, `order_items` tables + FKs + basic indexes |
+| `1700000001000-add-order-status-product-active` | Adds `status` enum to orders, `is_active` to products, `IDX_orders_created_at` |
+| `1700000002000-add-stock-idempotency` | Adds `stock` to products, `idempotency_key` (UNIQUE) to orders, `idempotency` table |
+| `1700000003000-add-orders-composite-index` | Adds composite index `(user_id, status, created_at DESC)` for the hot query |
+
+## Testing Concurrency
 
 ```bash
-# development
-$ npm run start
-
-# watch mode
-$ npm run start:dev
-
-# production mode
-$ npm run start:prod
+# Run the concurrency test (sends 30 parallel order requests)
+npx tsx scripts/concurrency-test.ts
 ```
 
-## Run tests
-
-```bash
-# unit tests
-$ npm run test
-
-# e2e tests
-$ npm run test:e2e
-
-# test coverage
-$ npm run test:cov
-```
-
-## Deployment
-
-When you're ready to deploy your NestJS application to production, there are some key steps you can take to ensure it runs as efficiently as possible. Check out the [deployment documentation](https://docs.nestjs.com/deployment) for more information.
-
-If you are looking for a cloud-based platform to deploy your NestJS application, check out [Mau](https://mau.nestjs.com), our official platform for deploying NestJS applications on AWS. Mau makes deployment straightforward and fast, requiring just a few simple steps:
-
-```bash
-$ npm install -g @nestjs/mau
-$ mau deploy
-```
-
-With Mau, you can deploy your application in just a few clicks, allowing you to focus on building features rather than managing infrastructure.
-
-## Resources
-
-Check out a few resources that may come in handy when working with NestJS:
-
-- Visit the [NestJS Documentation](https://docs.nestjs.com) to learn more about the framework.
-- For questions and support, please visit our [Discord channel](https://discord.gg/G7Qnnhy).
-- To dive deeper and get more hands-on experience, check out our official video [courses](https://courses.nestjs.com/).
-- Deploy your application to AWS with the help of [NestJS Mau](https://mau.nestjs.com) in just a few clicks.
-- Visualize your application graph and interact with the NestJS application in real-time using [NestJS Devtools](https://devtools.nestjs.com).
-- Need help with your project (part-time to full-time)? Check out our official [enterprise support](https://enterprise.nestjs.com).
-- To stay in the loop and get updates, follow us on [X](https://x.com/nestframework) and [LinkedIn](https://linkedin.com/company/nestjs).
-- Looking for a job, or have a job to offer? Check out our official [Jobs board](https://jobs.nestjs.com).
-
-## Support
-
-Nest is an MIT-licensed open source project. It can grow thanks to the sponsors and support by the amazing backers. If you'd like to join them, please [read more here](https://docs.nestjs.com/support).
-
-## Stay in touch
-
-- Author - [Kamil Myśliwiec](https://twitter.com/kammysliwiec)
-- Website - [https://nestjs.com](https://nestjs.com/)
-- Twitter - [@nestframework](https://twitter.com/nestframework)
-
-## License
-
-Nest is [MIT licensed](https://github.com/nestjs/nest/blob/master/LICENSE).
+The test sends 30 simultaneous `POST /orders` requests, each with a unique `Idempotency-Key`. Expected result: only requests where stock is available succeed; the rest get `400` (insufficient stock).
