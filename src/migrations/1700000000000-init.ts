@@ -47,6 +47,8 @@ export class Init1700000000000 implements MigrationInterface {
         "product_id" uuid NOT NULL,
         "quantity" int NOT NULL,
         "price_at_purchase" numeric(12, 2) NOT NULL,
+        "created_at" timestamptz NOT NULL DEFAULT now(),
+        "updated_at" timestamptz NOT NULL DEFAULT now(),
         CONSTRAINT "FK_order_items_order" FOREIGN KEY ("order_id") REFERENCES "orders"("id") ON DELETE CASCADE,
         CONSTRAINT "FK_order_items_product" FOREIGN KEY ("product_id") REFERENCES "products"("id") ON DELETE RESTRICT
       )`

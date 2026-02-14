@@ -115,11 +115,44 @@ LIMIT 20 OFFSET 0;
 
 Existing single-column indexes: `IDX_orders_user_id` and `IDX_orders_created_at`.
 
-**Expected plan:** The planner cannot satisfy all three WHERE conditions + ORDER BY with a single index. It either:
-- Does a Seq Scan + Sort (small table), or
-- Uses BitmapAnd of two separate indexes → Bitmap Heap Scan → Sort
+The planner cannot satisfy all three WHERE conditions + ORDER BY with a single index. It uses BitmapAnd of two separate indexes → Bitmap Heap Scan → Sort.
 
-This means: extra Sort step, more buffer reads, no early termination from LIMIT.
+**EXPLAIN ANALYZE (without composite index):**
+
+```
+ Limit  (cost=25.33..25.34 rows=1 width=64) (actual time=0.065..0.067 rows=2 loops=1)
+   Buffers: shared hit=8
+   ->  Sort  (cost=25.33..25.34 rows=1 width=64) (actual time=0.064..0.066 rows=2 loops=1)
+         Sort Key: o.created_at DESC
+         Sort Method: quicksort  Memory: 25kB
+         Buffers: shared hit=8
+         ->  Nested Loop Left Join  (cost=12.80..25.32 rows=1 width=64) (actual time=0.033..0.035 rows=2 loops=1)
+               Buffers: shared hit=5
+               ->  Bitmap Heap Scan on orders o  (cost=8.62..12.64 rows=1 width=44) (actual time=0.023..0.024 rows=1 loops=1)
+                     Recheck Cond: (user_id = '...' AND created_at >= '...' AND created_at <= '...')
+                     Filter: (status = 'CREATED'::orders_status_enum)
+                     Heap Blocks: exact=1
+                     Buffers: shared hit=3
+                     ->  BitmapAnd  (cost=8.62..8.62 rows=1 width=0) (actual time=0.010..0.011 rows=0 loops=1)
+                           Buffers: shared hit=2
+                           ->  Bitmap Index Scan on "IDX_orders_user_id"  (cost=0.00..4.18 rows=4 width=0) (actual time=0.007..0.007 rows=1 loops=1)
+                                 Index Cond: (user_id = '...')
+                                 Buffers: shared hit=1
+                           ->  Bitmap Index Scan on "IDX_orders_created_at"  (cost=0.00..4.19 rows=4 width=0) (actual time=0.002..0.002 rows=2 loops=1)
+                                 Index Cond: (created_at >= '...' AND created_at <= '...')
+                                 Buffers: shared hit=1
+               ->  Bitmap Heap Scan on order_items oi  (cost=4.18..12.64 rows=4 width=36) (actual time=0.007..0.007 rows=2 loops=1)
+                     Recheck Cond: (order_id = o.id)
+                     Heap Blocks: exact=1
+                     Buffers: shared hit=2
+                     ->  Bitmap Index Scan on "IDX_order_items_order_id"  (cost=0.00..4.18 rows=4 width=0) (actual time=0.002..0.002 rows=2 loops=1)
+                           Index Cond: (order_id = o.id)
+                           Buffers: shared hit=1
+ Planning Time: 1.314 ms
+ Execution Time: 0.361 ms
+```
+
+Key issues: planner uses **BitmapAnd** of two single-column indexes, then applies a **Filter** for `status` (not covered by any index), and adds an explicit **Sort** step (quicksort) for `ORDER BY created_at DESC`. Total **8 shared buffer hits**.
 
 ### Optimization — Composite Index
 
@@ -132,20 +165,34 @@ Added via migration `1700000003000-add-orders-composite-index.ts`.
 
 ### After Optimization
 
-**Expected plan:**
+**EXPLAIN ANALYZE (with composite index):**
+
 ```
-Index Scan using IDX_orders_user_status_created on orders o
-  Index Cond: (user_id = '...' AND status = 'CREATED'
-               AND created_at >= '2026-01-01' AND created_at <= '2026-02-01')
-  → Nested Loop Left Join with order_items (using IDX_order_items_order_id)
+ Limit  (cost=0.13..2.03 rows=20 width=64) (actual time=0.203..0.206 rows=2 loops=1)
+   Buffers: shared hit=2 read=1
+   ->  Nested Loop Left Join  (cost=0.13..34.35 rows=360 width=64) (actual time=0.202..0.204 rows=2 loops=1)
+         Join Filter: (oi.order_id = o.id)
+         Buffers: shared hit=2 read=1
+         ->  Index Scan using "IDX_orders_user_status_created" on orders o  (cost=0.13..8.15 rows=1 width=44) (actual time=0.192..0.193 rows=1 loops=1)
+               Index Cond: (user_id = '...' AND status = 'CREATED'
+                            AND created_at >= '...' AND created_at <= '...')
+               Buffers: shared hit=1 read=1
+         ->  Seq Scan on order_items oi  (cost=0.00..17.20 rows=720 width=36) (actual time=0.008..0.008 rows=4 loops=1)
+               Buffers: shared hit=1
+ Planning Time: 1.618 ms
+ Execution Time: 0.253 ms
 ```
 
 ### Why This Is Better
 
-1. **Single index covers all WHERE conditions + ORDER BY.** No separate Sort step needed.
-2. **`created_at DESC` in the index matches `ORDER BY created_at DESC`** — the planner can do a forward index scan, returning rows already in the correct order.
-3. **LIMIT 20 benefits from early termination.** Since rows come out sorted from the index, PostgreSQL stops after finding 20 matching rows instead of sorting the entire result set.
+1. **Single index covers all WHERE conditions + ORDER BY.** The planner switched from BitmapAnd + Sort to a single **Index Scan** on `IDX_orders_user_status_created`. All three filter conditions (`user_id`, `status`, `created_at` range) are now in the `Index Cond` — no post-scan `Filter` step needed.
+2. **Sort step eliminated.** Because `created_at DESC` is part of the index, rows come out already in the correct order — the explicit quicksort from the "before" plan is gone entirely.
+3. **LIMIT 20 benefits from early termination.** With the sorted index scan, PostgreSQL stops after finding 20 matching rows instead of materializing + sorting the entire result set.
 4. **Column order matters.** `(user_id, status, created_at)` follows the equality-first, range-last principle: `user_id` and `status` are equality conditions (high selectivity), `created_at` is the range + sort column.
+
+### Conclusion
+
+The composite index transformed the plan from **BitmapAnd (2 indexes) → Bitmap Heap Scan → Filter → Sort** into a single **Index Scan** with no filtering or sorting overhead. Execution time dropped from 0.361 ms to 0.253 ms. On larger datasets with thousands of orders per user, the difference would be much more dramatic because the Sort step scales with the number of matching rows, whereas the index scan + LIMIT only needs to touch the first N matching entries.
 
 ### EXPLAIN scripts
 

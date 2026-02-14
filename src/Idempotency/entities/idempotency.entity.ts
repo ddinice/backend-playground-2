@@ -16,7 +16,7 @@ export class Idempotency extends BaseEntity {
   @Column({ type: 'text', nullable: true })
   error: string;
 
-  @Column({ type: 'timestamp', nullable: true })
+  @Column({ type: 'timestamp', nullable: true, name: 'expires_at' })
   expiresAt?: Date;
 
   @Column({ type: 'varchar', default: 'completed' })
